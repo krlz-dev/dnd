@@ -6,9 +6,9 @@ const gameState = {
     currentCampaign: null,
     storyHistory: [],
     settings: {
-        aiProvider: 'demo',
+        aiProvider: 'groq',
         apiKey: '',
-        temperature: 0.7,
+        temperature: 0.8,
         dmStyle: 'balanced',
         autoRoll: true,
         soundEffects: false,
@@ -720,7 +720,7 @@ async function getAIResponse(prompt, context = 'gameplay') {
 
     const apiKey = gameState.settings.apiKey;
     if (!apiKey) {
-        showNotification('Please set your API key in settings', 'warning');
+        showNotification('Please set your API key in Settings to use AI', 'warning');
         return getDemoResponse(prompt, context);
     }
 
@@ -730,6 +730,10 @@ async function getAIResponse(prompt, context = 'gameplay') {
                 return await callOpenAI(prompt, context, apiKey);
             case 'groq':
                 return await callGroq(prompt, context, apiKey);
+            case 'together':
+                return await callTogether(prompt, context, apiKey);
+            case 'mistral':
+                return await callMistral(prompt, context, apiKey);
             case 'cohere':
                 return await callCohere(prompt, context, apiKey);
             case 'huggingface':
@@ -739,7 +743,7 @@ async function getAIResponse(prompt, context = 'gameplay') {
         }
     } catch (error) {
         console.error('AI API Error:', error);
-        showNotification('AI request failed, using demo mode', 'warning');
+        showNotification(`AI error: ${error.message}. Using demo mode.`, 'warning');
         return getDemoResponse(prompt, context);
     }
 }
@@ -779,18 +783,71 @@ async function callGroq(prompt, context, apiKey) {
             'Authorization': `Bearer ${apiKey}`
         },
         body: JSON.stringify({
-            model: 'llama-3.1-70b-versatile',
+            model: 'llama-3.3-70b-versatile',
             messages: [
                 { role: 'system', content: systemPrompt },
                 ...getConversationHistory(),
                 { role: 'user', content: prompt }
             ],
             temperature: gameState.settings.temperature,
-            max_tokens: 500
+            max_tokens: 800
         })
     });
 
     const data = await response.json();
+    if (data.error) throw new Error(data.error.message);
+    return data.choices[0].message.content;
+}
+
+async function callTogether(prompt, context, apiKey) {
+    const systemPrompt = getSystemPrompt(context);
+
+    const response = await fetch('https://api.together.xyz/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+            model: 'meta-llama/Llama-3.3-70B-Instruct-Turbo',
+            messages: [
+                { role: 'system', content: systemPrompt },
+                ...getConversationHistory(),
+                { role: 'user', content: prompt }
+            ],
+            temperature: gameState.settings.temperature,
+            max_tokens: 800
+        })
+    });
+
+    const data = await response.json();
+    if (data.error) throw new Error(data.error.message);
+    return data.choices[0].message.content;
+}
+
+async function callMistral(prompt, context, apiKey) {
+    const systemPrompt = getSystemPrompt(context);
+
+    const response = await fetch('https://api.mistral.ai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+            model: 'mistral-small-latest',
+            messages: [
+                { role: 'system', content: systemPrompt },
+                ...getConversationHistory(),
+                { role: 'user', content: prompt }
+            ],
+            temperature: gameState.settings.temperature,
+            max_tokens: 800
+        })
+    });
+
+    const data = await response.json();
+    if (data.error) throw new Error(data.error.message);
     return data.choices[0].message.content;
 }
 
@@ -818,23 +875,48 @@ async function callCohere(prompt, context, apiKey) {
 async function callHuggingFace(prompt, context, apiKey) {
     const systemPrompt = getSystemPrompt(context);
 
-    const response = await fetch('https://api-inference.huggingface.co/models/meta-llama/Meta-Llama-3-8B-Instruct', {
+    // Use chat format for better results
+    const messages = [
+        { role: 'system', content: systemPrompt },
+        ...getConversationHistory(),
+        { role: 'user', content: prompt }
+    ];
+
+    // Try Mistral model on HuggingFace (free and good for RP)
+    const response = await fetch('https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3', {
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
             'Authorization': `Bearer ${apiKey}`
         },
         body: JSON.stringify({
-            inputs: `${systemPrompt}\n\nUser: ${prompt}\n\nAssistant:`,
+            inputs: formatMessagesForHF(messages),
             parameters: {
-                max_new_tokens: 500,
-                temperature: gameState.settings.temperature
+                max_new_tokens: 600,
+                temperature: gameState.settings.temperature,
+                return_full_text: false
             }
         })
     });
 
     const data = await response.json();
-    return data[0]?.generated_text?.split('Assistant:').pop().trim() || getDemoResponse(prompt, context);
+    if (data.error) {
+        if (data.error.includes('loading')) {
+            showNotification('Model is loading, please wait...', 'info');
+            await new Promise(r => setTimeout(r, 3000));
+            return await callHuggingFace(prompt, context, apiKey);
+        }
+        throw new Error(data.error);
+    }
+    return data[0]?.generated_text?.trim() || getDemoResponse(prompt, context);
+}
+
+function formatMessagesForHF(messages) {
+    return messages.map(m => {
+        if (m.role === 'system') return `[INST] ${m.content} [/INST]`;
+        if (m.role === 'user') return `[INST] ${m.content} [/INST]`;
+        return m.content;
+    }).join('\n');
 }
 
 function getSystemPrompt(context) {
@@ -843,41 +925,59 @@ function getSystemPrompt(context) {
     const style = gameState.settings.dmStyle;
 
     const styleGuides = {
-        balanced: 'Balance storytelling with combat and exploration.',
-        narrative: 'Focus on rich descriptions and character development. Minimize combat.',
-        combat: 'Emphasize tactical combat and action sequences.',
-        roleplay: 'Prioritize dialogue, character interactions, and social encounters.',
-        hardcore: 'Be challenging and unforgiving. Consequences are real and permanent.'
+        balanced: 'Balance epic storytelling with tactical combat and mysterious exploration. Create moments of tension and wonder.',
+        narrative: 'Focus on immersive descriptions, emotional depth, and character development. Combat should serve the story. Create memorable NPCs with distinct voices.',
+        combat: 'Emphasize tactical combat, strategic positioning, and action sequences. Describe attacks vividly. Track enemy positions and conditions.',
+        roleplay: 'Prioritize dialogue, character interactions, and social intrigue. Give NPCs personalities, secrets, and motivations. Create diplomatic challenges.',
+        hardcore: 'Be ruthlessly fair. Resources are scarce, enemies are deadly, and poor decisions have permanent consequences. Death is always possible.'
     };
 
-    let prompt = `You are an expert Dungeon Master running a D&D 5e campaign. ${styleGuides[style] || ''}
-
-Current Campaign: ${campaign?.name || 'Custom Adventure'}
-Setting: ${campaign?.setting || 'Fantasy'}
-
-Player Character:
-- Name: ${char?.name || 'Unknown'}
-- Race: ${char?.race || 'Unknown'}
-- Class: ${char?.class || 'Unknown'}
-- Level: ${char?.level || 1}
-- Background: ${char?.background || 'Unknown'}
-
-Guidelines:
-- Keep responses concise (2-4 paragraphs max)
-- Be descriptive but not verbose
-- Present meaningful choices to the player
-- Follow D&D 5e rules where applicable
-- React to player actions logically
-- Include dice roll suggestions when appropriate
-- Create engaging NPCs and encounters`;
-
     if (context === 'backstory') {
-        prompt = 'Generate a compelling character backstory for a D&D character. Keep it to 2-3 paragraphs, include a motivation, a conflict, and a goal.';
-    } else if (context === 'campaign') {
-        prompt = 'You are creating a D&D campaign. Provide an engaging premise and opening scene.';
+        return `You are a creative writing assistant for D&D characters. Generate a compelling backstory for a ${char?.race || 'human'} ${char?.class || 'adventurer'} named ${char?.name || 'the hero'} with a ${char?.background || 'mysterious'} background.
+
+Include:
+- A defining moment from their past that shaped who they are
+- A personal motivation driving them to adventure
+- A secret, flaw, or unresolved conflict
+- A connection to the world (person, place, or organization)
+
+Write 2-3 vivid paragraphs in third person. Make it feel personal and emotionally resonant.`;
     }
 
-    return prompt;
+    if (context === 'campaign') {
+        return `You are a D&D campaign designer. Create an engaging campaign premise with:
+- A compelling hook that draws adventurers in
+- A mysterious or threatening situation
+- Hints of a larger story
+- An evocative opening scene
+
+Write 2-3 paragraphs that set the tone and invite exploration.`;
+    }
+
+    // Main gameplay prompt
+    return `You are an expert Dungeon Master running "${campaign?.name || 'an epic adventure'}" in a ${campaign?.setting || 'fantasy'} setting. ${styleGuides[style] || styleGuides.balanced}
+
+THE PLAYER CHARACTER:
+${char?.name || 'The Hero'}, a level ${char?.level || 1} ${char?.race || 'Human'} ${char?.class || 'Adventurer'}
+Background: ${char?.background || 'Unknown'} | HP: ${char?.hp || 10}/${char?.maxHp || 10}
+Stats: STR ${char?.stats?.str || 10}, DEX ${char?.stats?.dex || 10}, CON ${char?.stats?.con || 10}, INT ${char?.stats?.int || 10}, WIS ${char?.stats?.wis || 10}, CHA ${char?.stats?.cha || 10}
+
+YOUR ROLE AS DUNGEON MASTER:
+- IMMERSE the player with vivid sensory details (sights, sounds, smells, textures)
+- REACT dynamically to player choices - their actions have real consequences
+- CREATE interesting NPCs with distinct personalities, speech patterns, and motivations
+- CHALLENGE the player with meaningful decisions, not just combat
+- PACE the adventure with tension, mystery, and moments of discovery
+- USE the player's backstory and abilities when relevant
+- SUGGEST skill checks when actions require them (e.g., "Roll a DC 15 Perception check")
+
+RESPONSE FORMAT:
+- Write 2-4 paragraphs of engaging narrative
+- End with a clear situation or choice that invites player response
+- Use dialogue for NPCs (give them personality!)
+- Describe combat cinematically when it occurs
+
+Remember: You're telling a collaborative story. Make the player feel like a hero in an epic tale.`;
 }
 
 function getConversationHistory() {
@@ -888,21 +988,10 @@ function getConversationHistory() {
 }
 
 function getDemoResponse(action, context) {
-    // Simulate AI response in demo mode
     const actionLower = action.toLowerCase();
-    let responseType = 'default';
-
-    if (actionLower.includes('look') || actionLower.includes('observe') || actionLower.includes('examine')) {
-        responseType = 'look';
-    } else if (actionLower.includes('search') || actionLower.includes('find') || actionLower.includes('investigate')) {
-        responseType = 'search';
-    } else if (actionLower.includes('attack') || actionLower.includes('fight') || actionLower.includes('strike')) {
-        responseType = 'attack';
-    } else if (actionLower.includes('talk') || actionLower.includes('speak') || actionLower.includes('ask')) {
-        responseType = 'talk';
-    } else if (actionLower.includes('cast') || actionLower.includes('spell') || actionLower.includes('magic')) {
-        responseType = 'magic';
-    }
+    const char = gameState.character;
+    const charName = char?.name || 'Adventurer';
+    const charClass = char?.class || 'warrior';
 
     if (context === 'backstory') {
         return generateDemoBackstory();
@@ -912,39 +1001,72 @@ function getDemoResponse(action, context) {
         return generateDemoCampaign();
     }
 
-    const templates = demoResponses[responseType];
-    let response = templates[Math.floor(Math.random() * templates.length)];
+    // Enhanced demo responses based on action type
+    if (actionLower.includes('look') || actionLower.includes('observe') || actionLower.includes('examine')) {
+        return getRandomResponse([
+            `${charName} surveys the surroundings with practiced vigilance. The chamber stretches before you, ancient stone walls bearing the scars of countless years. Torchlight flickers against faded murals depicting battles long forgotten. In the far corner, something glints—metal, perhaps gold. The air carries the musty scent of age and secrets.\n\nTo your left, a narrow passage descends into darkness. Ahead, a heavy oak door stands slightly ajar, and you can hear faint whispers from beyond. What catches your attention?`,
+            `You take a moment to study your environment. Shadows dance along the walls as your torch wavers in an unseen draft. The floor is covered in a fine layer of dust, but you notice footprints—fresh ones—leading toward the eastern archway. Someone has been here recently.\n\nA stone pedestal in the center of the room holds an ornate box, its surface covered in strange runes that seem to pulse with a faint inner light. The whisper of danger tingles at the edge of your senses.`,
+            `Your keen eyes sweep across the area. This place tells a story of abandonment and mystery. Broken furniture lies scattered about, and ancient tapestries hang in tatters. But amid the decay, you spot something unusual: a section of wall that doesn't quite match the rest, as if it were added later.\n\nThe silence here feels heavy, expectant. Even the dust motes hanging in the air seem to wait for your next move.`
+        ]);
+    }
 
-    // Fill in template variables
-    Object.keys(storyElements).forEach(key => {
-        const values = storyElements[key];
-        const value = values[Math.floor(Math.random() * values.length)];
-        response = response.replace(`{${key}}`, value);
-    });
+    if (actionLower.includes('search') || actionLower.includes('find') || actionLower.includes('investigate')) {
+        const findings = ['a leather pouch containing 15 gold pieces', 'a dusty healing potion', 'a crumpled note with a cryptic message', 'a silver key with an unfamiliar crest', 'a hidden compartment in the wall'];
+        const found = findings[Math.floor(Math.random() * findings.length)];
+        return `${charName} searches the area methodically, running fingers along edges and checking beneath surfaces. Your persistence pays off—you discover ${found}!\n\nAs you pocket your find, you hear a sound from somewhere nearby. A door creaking? Footsteps? The dungeon seems to respond to your presence.\n\nWhat's your next move?`;
+    }
 
-    // Clean up any remaining placeholders
-    response = response.replace(/\{[^}]+\}/g, '...');
+    if (actionLower.includes('attack') || actionLower.includes('fight') || actionLower.includes('strike') || actionLower.includes('hit')) {
+        return getRandomResponse([
+            `${charName} springs into action! Your weapon arcs through the air with deadly precision. Roll for attack!\n\nYour enemy reacts, but your ${charClass} training serves you well. The clash of steel rings out as combat is joined. The creature before you snarls, wounded but not defeated—its eyes burning with malevolent fury.\n\n*Roll a d20 + your attack modifier to see if you hit!*`,
+            `With a fierce battle cry, you launch your assault! The enemy barely manages to raise its guard as your attack comes crashing down. This is what you were born for—the thrill of combat, the test of skill against skill.\n\nYour opponent staggers back, reassessing you with newfound wariness. Around you, the shadows seem to deepen, as if the dungeon itself watches this confrontation with interest.\n\n*Make your attack roll!*`,
+            `${charName} moves with the fluid grace of a seasoned combatant. Your strike is swift and sure—but your foe is cunning. They twist away at the last moment, your weapon grazing their armor.\n\nThe battle has begun in earnest. Your enemy circles you, looking for an opening. The air crackles with tension and the promise of violence.\n\nHow do you press your attack?`
+        ]);
+    }
 
-    return response + '\n\nWhat do you do next?';
+    if (actionLower.includes('talk') || actionLower.includes('speak') || actionLower.includes('ask') || actionLower.includes('greet')) {
+        return getRandomResponse([
+            `You approach and speak in a measured tone. The figure turns to face you, revealing weathered features and eyes that have seen much.\n\n"Ah, another adventurer," they say, voice rough as gravel. "I've been expecting someone like you. These halls... they've been restless lately. Something stirs in the deep places." They lean closer, lowering their voice. "If you seek the treasure, beware the guardian. It doesn't sleep—it waits."\n\nThey seem willing to say more, if you ask the right questions.`,
+            `${charName} steps forward to engage in conversation. The stranger regards you with a mixture of curiosity and caution.\n\n"You have courage, coming here," they observe. "Or perhaps foolishness—the two often look the same." A dry laugh escapes them. "I can help you, ${charClass}, but nothing in this world is free. Do something for me first, and I'll share what I know about what lies ahead."\n\nWhat do you say?`,
+            `You make contact, choosing your words carefully. The NPC listens with an unreadable expression.\n\n"Interesting," they murmur when you finish. "Very interesting indeed. You're not the first to come seeking answers, but you may be the first worthy of receiving them." They gesture toward a worn map on the table. "Let me show you something. But understand—once you see this, there's no turning back."\n\nDo you look at the map?`
+        ]);
+    }
+
+    if (actionLower.includes('cast') || actionLower.includes('spell') || actionLower.includes('magic')) {
+        return getRandomResponse([
+            `${charName} reaches for the arcane energies that flow through all things. Your fingers trace mystic patterns in the air as words of power spill from your lips. The spell builds, reality bending to your will—\n\nMagical energy erupts from your hands in a brilliant display! The effect ripples outward, and for a moment, the very air shimmers with otherworldly light. Your magic has been unleashed.\n\nWhat was your target, and what happens next?`,
+            `You channel your magical abilities, feeling the familiar surge of power course through your veins. The spell components align perfectly as you complete the incantation.\n\nArcane fire—or perhaps lightning, or ice—manifests at your command. The raw power of magic answers your call, ready to be shaped by your intent. Even in demo mode, a ${charClass} can feel the thrill of wielding such forces.\n\nDescribe your spell's effect!`,
+            `Drawing upon your training, ${charName} begins weaving a spell. The ambient magical energy in this ancient place responds eagerly—perhaps too eagerly. The dungeon's walls seem to pulse in rhythm with your casting.\n\nYour spell succeeds, but you sense that magic works... differently here. More powerfully, but also more dangerously. The shadows seem to lean in, curious about this display of arcane might.\n\nWhat did you cast, and what do you do now?`
+        ]);
+    }
+
+    // Default response for other actions
+    return getRandomResponse([
+        `${charName}'s action sends ripples through the narrative. The dungeon responds in unexpected ways—a distant echo, a shift in the air, the feeling of being watched.\n\nYou've made your move. Now the world reacts. Something has changed, though whether for better or worse remains to be seen. The path forward beckons, full of mystery and potential.\n\nWhat do you do next?`,
+        `You act decisively. Your choice matters here—every decision shapes the story, every action has consequences. The adventure continues to unfold around you, responsive to your will.\n\nThe chamber holds its breath, waiting to see what ${charName} will do next. Opportunities and dangers alike present themselves.\n\nHow do you proceed?`,
+        `The ${charClass} makes their move. In the grand tapestry of this adventure, another thread is woven. Whether this leads to glory or peril, only time will tell.\n\n*[Demo mode provides scripted responses. For dynamic AI storytelling, configure an API key in Settings!]*\n\nWhat action do you take?`
+    ]);
+}
+
+function getRandomResponse(responses) {
+    return responses[Math.floor(Math.random() * responses.length)];
 }
 
 function generateDemoBackstory() {
-    const hooks = [
-        'was raised by wolves in the wilderness',
-        'escaped from a noble house after witnessing a terrible crime',
-        'was the sole survivor of a village destroyed by dragons',
-        'served in a legendary mercenary company',
-        'was trained by a mysterious hermit'
-    ];
-    const motivations = [
-        'seeks revenge against those who wronged them',
-        'searches for a lost family heirloom',
-        'hopes to prove their worth to the world',
-        'wants to discover the truth about their mysterious past',
-        'aims to protect the innocent from evil'
+    const char = gameState.character;
+    const name = char?.name || 'The hero';
+    const race = char?.race || 'human';
+    const charClass = char?.class || 'adventurer';
+
+    const backstories = [
+        `${name} was not always a ${charClass}. Born into a humble family of ${race} craftspeople, their life changed forever when a band of raiders destroyed their village. Amidst the flames and chaos, ${name} discovered a hidden strength—a power that had slumbered within them, waiting for the moment of greatest need.\n\nTaken in by a wandering mentor who recognized their potential, ${name} spent years honing their skills. The mentor spoke often of a darkness gathering in the world, of ancient evils stirring in forgotten places. When the mentor disappeared without a trace, ${name} knew their time of preparation was over.\n\nNow ${name} walks the dangerous paths between civilization and shadow, searching for answers about their mentor's fate while confronting the growing darkness. Every battle brings them closer to the truth—and to the vengeance they've sworn against those who destroyed everything they loved.`,
+
+        `The ${race} known as ${name} carries a secret that could shake kingdoms. Once a trusted member of an elite order, they uncovered a conspiracy reaching to the highest levels of power. Betrayed by those they trusted most, ${name} barely escaped with their life—and with evidence of the plot.\n\nThe skills that made ${name} an exceptional ${charClass} now serve a different purpose: survival. Hunted by assassins and unable to trust anyone, they've learned to rely on their wits and their weapon. But ${name} is not content merely to survive. The same fire that made them excel in their former life now drives them to expose the truth.\n\nSomewhere in the world, the conspirators continue their machinations. ${name} moves through the shadows, gathering allies where they can be found, building strength for the day of reckoning. The road is dangerous, but ${name} has never been one to shy away from a fight.`,
+
+        `Legend speaks of a child born under a blood-red moon, marked by fate for greatness—or destruction. ${name}, the ${race} ${charClass}, is that child. Raised in secrecy by those who recognized the signs, ${name} grew up knowing they were different, but never understanding why.\n\nThe powers that manifested during adolescence were both a gift and a curse. ${name} could do things others couldn't, but each use of these abilities drew the attention of dark forces. Their guardians were killed protecting them, and ${name} was forced to flee into the wider world.\n\nNow ${name} seeks to understand the truth of their origins. The prophecy speaks of a choice that must be made—a moment when ${name} will determine the fate of many. Will they embrace the darkness, or stand against it? Only time, and the trials ahead, will reveal the answer.`
     ];
 
-    return `${hooks[Math.floor(Math.random() * hooks.length)]}. After years of hardship, they ${motivations[Math.floor(Math.random() * motivations.length)]}. Their journey has led them to become an adventurer, seeking fortune and glory in dangerous lands.`;
+    return backstories[Math.floor(Math.random() * backstories.length)];
 }
 
 function generateDemoCampaign() {
